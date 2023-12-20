@@ -9,6 +9,7 @@ release.zip
 
 # testing
 /coverage
+/venv
 
 # production
 /build
