@@ -1,9 +1,15 @@
 import port.api.props as props
 from port.api.commands import (CommandSystemDonate, CommandSystemExit, CommandUIRender)
 
-import pandas as pd
+from datetime import datetime, timezone
 import zipfile
+#from ddpinspect import instagram
 
+import pandas as pd
+import json
+
+
+# all functions during the donation process are called here
 
 def process(sessionId):
     yield donate(f"{sessionId}-tracking", '[{ "message": "user entered script" }]')
@@ -46,6 +52,7 @@ def process(sessionId):
 
     yield exit(0, "Success")
 
+# render pages used in process
 
 def render_donation_page(body):
     header = props.PropsUIHeader(props.Translatable({
@@ -81,43 +88,138 @@ def prompt_file(extensions):
 
     return props.PropsUIPromptFileInput(description, extensions)
 
+#main function to process zip files
 
-def doSomethingWithTheFile(filename):
-    return extract_zip_contents(filename)
+def doSomethingWithTheFile(filename): 
+    """takes zip folder, extracts relevant json file contents (your_topics, posts_viewed, videos_watched), then extracts & processes relevant information and returns them as dataframes"""
 
+    #your topics
+    your_topics_file = extractJsonContentFromZipFolder(filename, "your_topics")
+    yourTopics_df = extract_topics_df(your_topics_file)
 
-def extract_zip_contents(filename):
-    names = []
-    try:
-        file = zipfile.ZipFile(filename)
-        data = []
-        for name in file.namelist():
-            names.append(name)
-            info = file.getinfo(name)
-            data.append((name, info.compress_size, info.file_size))
-        return data
-    except zipfile.error:
-        return "invalid"
+    #aggregated post views/day
+    posts_viewed_file = extractJsonContentFromZipFolder(filename, "posts_viewed")    
+    postViewsperDay_df = get_postViewsPerDay(posts_viewed_file)
 
+    #aggregated video views/day
+    videos_viewed_file = extractJsonContentFromZipFolder(filename, "videos_watched")   
+    videoViewsperDay_df = get_videoViewsPerDay(videos_viewed_file)
+
+    data = [yourTopics_df, postViewsperDay_df, videoViewsperDay_df]
+
+    print(data)
+
+    return data 
+
+#main content of consent page: displays all data in donation
 
 def prompt_consent(data, meta_data):
 
-    table_title = props.Translatable({
-        "en": "Zip file contents",
+    your_topics_title = props.Translatable({
+        "en": "Your Topics inferred by Instagram",
         "nl": "Inhoud zip bestand"
     })
 
-    log_title = props.Translatable({
-        "en": "Log messages",
-        "nl": "Log berichten"
+    posts_viewed_title = props.Translatable({
+        "en": "Number of posts viewed each day in the last week",
+        "nl": "Inhoud zip bestand"
     })
 
-    data_frame = pd.DataFrame(data, columns=["filename", "compressed size", "size"])
-    table = props.PropsUIPromptConsentFormTable("zip_content", table_title, data_frame)
-    meta_frame = pd.DataFrame(meta_data, columns=["type", "message"])
-    meta_table = props.PropsUIPromptConsentFormTable("log_messages", log_title, meta_frame)
-    return props.PropsUIPromptConsentForm([table], [meta_table])
+    videos_watched_title = props.Translatable({
+        "en": "Number of videos watched each day in the last week",
+        "nl": "Inhoud zip bestand"
+    })
 
+
+    table_list = []
+
+    table = props.PropsUIPromptConsentFormTable("your_topics", your_topics_title, data[0])
+    table_list.append(table)
+
+    table = props.PropsUIPromptConsentFormTable("posts_viewed", posts_viewed_title, data[1])
+    table_list.append(table)
+
+    table = props.PropsUIPromptConsentFormTable("videos_watched", videos_watched_title, data[2]) 
+    table_list.append(table)
+    
+    return props.PropsUIPromptConsentForm(table_list, [])
+
+
+# ---
+# helper files for extraction
+
+def extractJsonContentFromZipFolder(zip_file_path, pattern):
+    with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+        # Get the list of file names in the zip file
+        file_names = zip_ref.namelist()
+        
+        targetdict = {}
+
+        for file_name in file_names:
+                if (file_name.endswith('.json')) and (pattern in file_name):
+                    # Read the JSON file into a dictionary
+                    with zip_ref.open(file_name) as json_file:
+                        json_content = json_file.read()
+                        data = json.loads(json_content)
+                        targetdict[file_name] = data
+                    break
+
+                if file_name == file_names[-1]:
+                    print(f"File {pattern}.json is not contained")
+                    return None
+
+    return targetdict[file_name]
+
+def import_json_toDict(jsonfile):
+    """loads json file as dict"""
+    f = open(jsonfile)
+    json_dict = json.load(f)
+    return json_dict
+
+def extract_topics_df(topics_dict):
+    """takes the content of your_topics jsonfile, extracts topics and returns them as a dataframe"""
+    if topics_dict != None:
+        topics_list = [t['string_map_data']['Name']['value'] for t in topics_dict['topics_your_topics']]
+        topics_df = pd.DataFrame(topics_list, columns=['your_topics'])
+        return topics_df
+
+def epoch_to_date(epoch_timestamp: str | int) -> str: #thanks ddp-inspector/ddpinspect/src/parserlib/stringparse.py
+    """
+    Convert epoch timestamp to an ISO 8601 string. Assumes UTC. -> UTC +1
+
+    If timestamp cannot be converted raise CannotConvertEpochTimestamp
+    """
+    try:
+        epoch_timestamp = int(epoch_timestamp)
+        out = datetime.fromtimestamp(epoch_timestamp, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError, TypeError) as e:
+        logger.error("Could not convert epoch time timestamp, %s", e)
+        raise CannotConvertEpochTimestamp("Cannot convert epoch timestamp") from e
+
+    out = pd.to_datetime(out)
+    return out.date()
+
+    
+# probably want to restrict the days to those within the study period?
+def get_postViewsPerDay(posts_viewed_dict):
+    """takes content of posts_viewed json file and returns dataframe with number of viewed posts/day"""
+    timestamps = [t['string_map_data']['Time']['timestamp'] for t in posts_viewed_dict['impressions_history_posts_seen']] # get list with timestamps in epoch format
+    dates = [epoch_to_date(t) for t in timestamps] # convert epochs to dates
+    postViewedDates_df = pd.DataFrame(dates, columns=['date']) # convert to df
+    aggregated_df = postViewedDates_df.groupby(["date"])["date"].size() # count number of rows per day
+    return aggregated_df.reset_index(name='postsViewed_count')
+
+# maybe combine results from get_postViewsPerDay and get_videoViewsPerDay in one dataframe? columns:  date | postsViewed_count | videosViewed_count
+def get_videoViewsPerDay(videos_watched_dict):
+    """takes content of videos_watched json file and returns dataframe with number of viewed posts/day"""
+    timestamps = [t['string_map_data']['Time']['timestamp'] for t in videos_watched_dict["impressions_history_videos_watched"]] # get list with timestamps in epoch format
+    dates = [epoch_to_date(t) for t in timestamps] # convert epochs to dates
+    videosViewedDates_df = pd.DataFrame(dates, columns=['date']) # convert to df
+    aggregated_df = videosViewedDates_df.groupby(["date"])["date"].size() # count number of rows per day
+    return aggregated_df.reset_index(name='videosViewed_count')
+
+
+# unedited from PORT, best leave like that :)
 
 def donate(key, json_string):
     return CommandSystemDonate(key, json_string)
